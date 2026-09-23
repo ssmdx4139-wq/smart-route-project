@@ -16,7 +16,7 @@ two-stage pipeline:
    candidates behind the driver. Times come from a live OSRM engine or, offline, a
    deterministic two-speed heuristic (30 km/h under 800 m, 80 km/h otherwise, plus 20 s per leg).
 
-A greedy nearest-neighbour sequencer (`sequencer.py`) orders multiple stops, and a
+A sequencer (`sequencer.py`) orders up to nine stops (greedy nearest-neighbour or route order, whichever is quicker), and a
 Gradio + Folium dashboard (`app.py`) shows the route, the corridor, every candidate and the
 recommendation. Everything runs on open data (OpenStreetMap) and free, open-source routing.
 
@@ -28,7 +28,7 @@ smartroute/
 |   |-- geometry.py        # haversine distance, cross-track/along-track projection
 |   |-- corridor.py        # Stage 1: the Smart Corridor geometric filter
 |   |-- costing.py         # Stage 2: OSRM / heuristic detour-time ranking
-|   |-- sequencer.py       # Stage 3: greedy multi-stop sequencing
+|   |-- sequencer.py       # Stage 3: multi-stop sequencing (up to 9 stops)
 |   |-- baseline_radius.py # control group: conventional radius-based search
 |   |-- data_loader.py     # OSMnx / Overpass / OSRM live data plus an offline sample set
 |   |-- dubai_roads.py     # offline approximate network of Dubai's main roads, with sample stops
@@ -89,21 +89,26 @@ SmartRoute shown as an app open on an Apple CarPlay screen, filling the browser 
   for each stop type, numbered pins for the suggested stops, a thick route with an outline, and
   a black muscle-car marker pointing along the route. A pill shows LIVE or OFFLINE data.
 * **CarPlay tabbed panel** on the right:
-  * *Drive* - trip cards (ETA, stops with the time each adds, directions with left/right turns)
+  * *Drive* - the corridor width slider (the trip updates as you move it), trip cards (ETA, stops with the time each adds, directions with left/right turns)
     and a collapsed "Why these stops?" card comparing the Smart Corridor with a radius search.
   * *Where to* - From, Swap, To, stop-type buttons and Go (which jumps back to Drive).
-  * *Settings* - corridor width, distance already driven, live data and map style.
+  * *Settings* - distance already driven, live data and map style.
 
 Controls:
 
 * **From / To** – starts on the saved trip Office (Bay Square, Business Bay) → Home
   (Dubai Hills Estate). Pick another Dubai place, type a place name (looked up with OpenStreetMap Nominatim),
   or type coordinates as `25.2, 55.27`. The ⇅ button swaps them.
-* **Stops on the way** – one or more of supermarket, pharmacy, petrol station, mosque and park.
+* **Stops on the way** – up to nine of supermarket, pharmacy, petrol station, mosque, park, cafe,
+  restaurant, ATM and EV charging. Live places are cached per map tile in `cache/` for a week.
+* **Choosing a stop yourself** – tap any pin inside the corridor and press *Use this stop*; it replaces
+  the automatic pick for that stop type and the order, times and route are recalculated. *Back to
+  automatic* on the pin, or *Use automatic stops* under the trip, undoes it.
   With several, the best stop of each type is found and the visiting order is chosen greedily (FR7).
 * **Distance already driven** – where the vehicle is now; stops more than 250 m behind it are
   excluded (FR4).
-* **Corridor width** – 50 to 500 m (default 150 m), half-width either side of the route.
+* **Corridor width** – 50 m to 3 km (default 150 m), half-width either side of the route. With a wide
+  corridor the 40 most promising places of each stop type (by the offline estimate) get live drive times.
 * **Use live Overpass POI data** (on by default) – real POIs along the route in one Overpass query
   (tries several mirrors); falls back to the offline sample if the query fails.
 * **Use live OSRM routing** (on by default) – the real road route, road names and travel times;

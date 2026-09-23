@@ -190,6 +190,8 @@ def route(origin: LatLon, destination: LatLon) -> NetworkRoute:
 # Offline sample stops along the network
 # ---------------------------------------------------------------------------
 _CYCLE = ["petrol station", "supermarket", "mosque", "pharmacy", "park"]
+_EXTRA_CYCLE = ["cafe", "atm", "restaurant", "ev charging"]
+_NAMES = {"cafe": "Cafe", "atm": "ATM", "ev charging": "EV charging"}
 FIRST_STOP_M, STOP_SPACING_M = 900.0, 1700.0
 
 
@@ -210,33 +212,40 @@ def network_pois(places: Dict[str, LatLon]) -> List[POI]:
 
     Stops sit 30-120 m from the carriageway (parks 170-260 m, as they are set
     back from the road), alternating sides, with a side-street decoy 600-900 m
-    away at every third position.
+    away at every third position. The newer stop types (_EXTRA_CYCLE) sit
+    half-way between those, on Sheikh Zayed Road too, which has no curated
+    sample for them.
     """
+    return (_generate(places, _CYCLE, FIRST_STOP_M, "n", skip_szr=True)
+            + _generate(places, _EXTRA_CYCLE, FIRST_STOP_M + STOP_SPACING_M / 2, "e", skip_szr=False))
+
+
+def _generate(places: Dict[str, LatLon], cycle: List[str], first_m: float, prefix: str, skip_szr: bool) -> List[POI]:
     pois: List[POI] = []
     k = 0
     for road, _, chain in ROADS:
-        if road == "Sheikh Zayed Rd":
+        if skip_szr and road == "Sheikh Zayed Rd":
             continue
         line = [NODES[n] for n in chain]
         seg_lengths = [haversine_m(a, b) for a, b in zip(line, line[1:])]
         total = sum(seg_lengths)
-        pos = FIRST_STOP_M
+        pos = first_m
         while pos < total - 300:
             at = point_along(line, pos)
             travelled, i = 0.0, 0
             while i < len(seg_lengths) - 1 and travelled + seg_lengths[i] < pos:
                 travelled += seg_lengths[i]
                 i += 1
-            cat = _CYCLE[k % len(_CYCLE)]
+            cat = cycle[k % len(cycle)]
             side = 1 if k % 2 == 0 else -1
             off = (170 + (k * 37) % 90) if cat == "park" else (30 + (k * 29) % 90)
             p = _offset_point(line[i], line[i + 1], at, side * off)
             area = _nearest_place(p, places)
-            pois.append(POI("n%03d" % k, "%s - %s, near %s" % (cat.capitalize(), road, area), cat, p[0], p[1],
+            pois.append(POI("%s%03d" % (prefix, k), "%s - %s, near %s" % (_NAMES.get(cat, cat.capitalize()), road, area), cat, p[0], p[1],
                             {"pattern": "convenient", "source": "offline network sample"}))
             if k % 3 == 2:
                 q = _offset_point(line[i], line[i + 1], at, -side * (600 + (k * 53) % 300))
-                pois.append(POI("n%03dx" % k, "%s - side street off %s, near %s" % (cat.capitalize(), road, _nearest_place(q, places)),
+                pois.append(POI("%s%03dx" % (prefix, k), "%s - side street off %s, near %s" % (_NAMES.get(cat, cat.capitalize()), road, _nearest_place(q, places)),
                                 cat, q[0], q[1], {"pattern": "side_street", "source": "offline network sample"}))
             k += 1
             pos += STOP_SPACING_M

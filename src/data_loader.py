@@ -21,16 +21,27 @@ so the offline sample, the tests and the benchmark need nothing beyond the
 Python standard library (NFR3, NFR4).
 """
 
+import json
+import math
+import os
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import dubai_roads
 import net
 from corridor import POI
-from geometry import LatLon, haversine_m
+from geometry import LatLon, haversine_m, nearest_projection
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-OVERPASS_MIRRORS = [OVERPASS_URL, "https://overpass.kumi.systems/api/interpreter",
-                    "https://overpass.private.coffee/api/interpreter"]
+# overpass-api.de and the two machines behind it; the old third-party mirrors no longer answer
+OVERPASS_MIRRORS = [OVERPASS_URL, "https://lambert.openstreetmap.de/api/interpreter",
+                    "https://gall.openstreetmap.de/api/interpreter"]
+# live places are cached on disk per TILE_DEG x TILE_DEG tile (about 4.4 km)
+TILE_DEG = 0.04
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache", "overpass_tiles.json")
+CACHE_VERSION = 1
+CACHE_MAX_AGE_S = 7 * 24 * 3600
+MAX_STOPS = 9
 OSRM_SERVERS = ["https://router.project-osrm.org", "https://routing.openstreetmap.de/routed-car"]
 HTTP_HEADERS = {"User-Agent": "SmartRoute-MSc-project/1.0 (educational demo)"}
 
@@ -41,6 +52,10 @@ CATEGORY_TAGS: Dict[str, List[Dict[str, str]]] = {
     "petrol station": [{"amenity": "fuel"}],
     "mosque": [{"amenity": "place_of_worship", "religion": "muslim"}],
     "park": [{"leisure": "park"}],
+    "cafe": [{"amenity": "cafe"}],
+    "restaurant": [{"amenity": "restaurant"}, {"amenity": "fast_food"}],
+    "atm": [{"amenity": "atm"}],
+    "ev charging": [{"amenity": "charging_station"}],
 }
 CATEGORIES = list(CATEGORY_TAGS)
 
@@ -276,40 +291,110 @@ def _thin(route: Sequence[LatLon], spacing_m: float) -> List[LatLon]:
     return out
 
 
-def load_live_pois_along(categories: Sequence[str], route: Sequence[LatLon], radius_m: float,
-                         timeout_s: float = 30.0) -> Dict[str, List[POI]]:
-    """POIs of every category within ``radius_m`` of the route, in one Overpass query (FR2).
+def _tile_of(p: LatLon) -> Tuple[int, int]:
+    return int(math.floor(p[0] / TILE_DEG)), int(math.floor(p[1] / TILE_DEG))
 
-    Uses Overpass's ``around`` filter along the route line, so only the strip
-    round the route is downloaded, and tries each mirror in OVERPASS_MIRRORS.
-    Raises if every mirror fails.
+
+def _tiles_along(route: Sequence[LatLon], radius_m: float) -> List[Tuple[int, int]]:
+    """Every cache tile that the strip of ``radius_m`` round the route touches."""
+    pad = radius_m / 111000.0 + 0.002
+    tiles = set()
+    for lat, lon in _thin(route, 200.0):
+        dlon = pad / max(math.cos(math.radians(lat)), 0.2)
+        for a in (lat - pad, lat + pad):
+            for b in (lon - dlon, lon + dlon):
+                tiles.add(_tile_of((a, b)))
+        tiles.add(_tile_of((lat, lon)))
+    return sorted(tiles)
+
+
+def _read_cache() -> Dict[str, dict]:
+    try:
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+        return data.get("tiles", {}) if data.get("version") == CACHE_VERSION else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_cache(tiles: Dict[str, dict]) -> None:
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": CACHE_VERSION, "tiles": tiles}, f)
+        os.replace(tmp, CACHE_FILE)
+    except OSError:  # a read-only folder only costs the cache
+        pass
+
+
+def overpass_elements(query: str, timeout_s: float = 25.0, deadline_s: float = 75.0) -> list:
+    """Run an Overpass query, retrying across OVERPASS_MIRRORS while the servers are busy.
+
+    The public servers often answer 504/429 under load, so each server gets a
+    short timeout and the list is tried again until ``deadline_s`` runs out.
     """
-    line = ",".join("%.5f,%.5f" % p for p in _thin(route, 250.0))
-    parts = []
-    for category in categories:
-        for tags in CATEGORY_TAGS[category]:
-            filt = "".join('["%s"="%s"]' % kv for kv in tags.items())
-            parts.append("nwr%s(around:%d,%s);" % (filt, int(radius_m), line))
-    query = "[out:json][timeout:25];(%s);out center tags;" % "".join(parts)
+    started = time.monotonic()
     error: Exception = RuntimeError("no Overpass server configured")
-    for url in OVERPASS_MIRRORS:
-        try:
-            elements = net.post_form_json(url, {"data": query}, timeout_s).get("elements", [])
-            break
-        except Exception as exc:  # try the next mirror
-            error = exc
-    else:
-        raise error
-    found: Dict[str, List[POI]] = {c: [] for c in categories}
-    for el in elements:
+    for attempt in range(4):
+        for url in OVERPASS_MIRRORS:
+            left = deadline_s - (time.monotonic() - started)
+            if left < 5:
+                raise error
+            try:
+                return net.post_form_json(url, {"data": query}, min(timeout_s, left)).get("elements", [])
+            except Exception as exc:  # busy or unreachable: try the next server
+                error = exc
+        time.sleep(1.5 * (attempt + 1))
+    raise error
+
+
+def _fetch_tiles(tiles: Sequence[Tuple[int, int]]) -> Dict[str, dict]:
+    """Every POI of every category in ``tiles``, from Overpass, keyed like the cache."""
+    boxes = ["(%.4f,%.4f,%.4f,%.4f)" % (i * TILE_DEG, j * TILE_DEG, (i + 1) * TILE_DEG, (j + 1) * TILE_DEG) for i, j in tiles]
+    parts = []
+    for options in CATEGORY_TAGS.values():
+        for tags in options:
+            filt = "".join('["%s"="%s"]' % kv for kv in tags.items())
+            parts += ["nwr%s%s;" % (filt, box) for box in boxes]
+    query = "[out:json][timeout:25];(%s);out center tags;" % "".join(parts)
+    now = time.time()
+    fresh = {"%d,%d" % t: {"t": now, "pois": []} for t in tiles}
+    for el in overpass_elements(query):
         tags = el.get("tags", {})
         category = _classify(tags)
         lat = el.get("lat", el.get("center", {}).get("lat"))
         lon = el.get("lon", el.get("center", {}).get("lon"))
-        if category not in found or lat is None or lon is None:
+        if category is None or lat is None or lon is None:
             continue
-        name = tags.get("name:en") or tags.get("name") or tags.get("brand") or category.capitalize()
-        found[category].append(POI("%s/%s" % (el.get("type", "node"), el.get("id")), name, category, float(lat), float(lon), tags))
+        key = "%d,%d" % _tile_of((lat, lon))
+        if key in fresh:
+            name = tags.get("name:en") or tags.get("name") or tags.get("brand") or dubai_roads._NAMES.get(category, category.capitalize())
+            fresh[key]["pois"].append(["%s/%s" % (el.get("type", "node"), el.get("id")), name, category, lat, lon])
+    return fresh
+
+
+def load_live_pois_along(categories: Sequence[str], route: Sequence[LatLon], radius_m: float,
+                         max_age_s: float = CACHE_MAX_AGE_S) -> Dict[str, List[POI]]:
+    """POIs of every category within ``radius_m`` of the route (FR2).
+
+    Places are downloaded per map tile (every category at once) and kept in a
+    disk cache for a week, so a repeated or overlapping trip needs no Overpass
+    request at all and a busy Overpass server only matters on the first trip
+    through an area. Raises if uncached tiles cannot be downloaded.
+    """
+    wanted = _tiles_along(route, radius_m)
+    cache = _read_cache()
+    missing = [t for t in wanted if time.time() - cache.get("%d,%d" % t, {}).get("t", 0) > max_age_s]
+    for i in range(0, len(missing), 8):  # a few tiles per request keeps each query light
+        cache.update(_fetch_tiles(missing[i:i + 8]))
+        _write_cache(cache)
+    line = _thin(route, 100.0)
+    found: Dict[str, List[POI]] = {c: [] for c in categories}
+    for t in wanted:
+        for pid, name, category, lat, lon in cache["%d,%d" % t]["pois"]:
+            if category in found and nearest_projection(line, (lat, lon)).cross_track_m <= radius_m:
+                found[category].append(POI(pid, name, category, float(lat), float(lon), {}))
     return found
 
 

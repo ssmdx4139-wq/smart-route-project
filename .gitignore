@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 src/evaluation_results.json
 src/figures/
+cache/

@@ -23,6 +23,7 @@ model, and the trip panel always says which source produced the numbers (NFR5).
 
 import datetime
 import html
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -39,7 +40,7 @@ from baseline_radius import radius_search
 from corridor import CorridorCandidate, SmartCorridor, corridor_reason
 from costing import DetourCostEngine, HeuristicBackend, OSRMBackend
 from geometry import LatLon, haversine_m, point_along, route_length_m
-from sequencer import greedy_sequence
+from sequencer import best_sequence
 
 CATEGORY_COLORS = {
     "supermarket": "#0a84ff",
@@ -47,6 +48,10 @@ CATEGORY_COLORS = {
     "petrol station": "#ff9f0a",
     "mosque": "#30b158",
     "park": "#32ade6",
+    "cafe": "#a2845e",
+    "restaurant": "#ff453a",
+    "atm": "#5e5ce6",
+    "ev charging": "#64d2ff",
 }
 CATEGORY_ICONS = {
     "supermarket": "&#128722;",     # shopping cart
@@ -54,12 +59,20 @@ CATEGORY_ICONS = {
     "petrol station": "&#9981;",    # fuel pump
     "mosque": "&#128332;",          # mosque
     "park": "&#127795;",            # tree
+    "cafe": "&#9749;",              # hot drink
+    "restaurant": "&#127860;",      # fork and knife
+    "atm": "&#127975;",             # ATM sign
+    "ev charging": "&#128268;",     # electric plug
 }
 CATEGORY_LABELS = {"supermarket": "Supermarket", "pharmacy": "Pharmacy", "petrol station": "Petrol",
-                   "mosque": "Mosque", "park": "Park"}
+                   "mosque": "Mosque", "park": "Park", "cafe": "Cafe", "restaurant": "Restaurant",
+                   "atm": "ATM", "ev charging": "EV charging"}
 FILTERED_COLOR = "#8e8e93"
 TRIP_COLOR = "#30d158"
 CORRIDOR_CIRCLE_SPACING_M = 400.0
+MAX_CORRIDOR_M = 3000          # the corridor width slider goes up to 3 km
+MAX_COSTED = 40                # per stop type, candidates costed with live times (a 3 km corridor can hold hundreds)
+MAX_GREY_DOTS = 60             # per stop type, filtered-out candidates drawn on the map
 MAP_HEIGHT_PX = 700      # the height of the CarPlay screen
 DEFAULT_FROM, DEFAULT_TO = list(data_loader.PLACES)[:2]   # Office -> Home
 UI_FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',Arial,sans-serif"
@@ -124,9 +137,7 @@ def acquire_pois(categories: List[str], route, width_m: float, use_live: bool) -
     if use_live:
         try:
             found = data_loader.load_live_pois_along(categories, route, max(width_m, 150.0) + 400.0)
-            if any(found.values()):
-                return found, "live OpenStreetMap (Overpass API)"
-            note = " - live query returned no results"
+            return found, "live OpenStreetMap (Overpass API)"
         except Exception as exc:  # network, timeout, bad response
             note = " - live query failed (%s)" % why(exc)
     return {c: data_loader.offline_pois(c) for c in categories}, "offline sample dataset" + note
@@ -293,9 +304,15 @@ def card(title: str, body: str) -> Tuple[str, str]:
 
 
 def plan_trip(from_name: str, to_name: str, categories: List[str], width_m: float, progress_km: float,
-              use_live_pois: bool, use_live_osrm: bool, theme: str = "Night"):
-    """Run the full pipeline and return (map HTML, trip panel HTML)."""
+              use_live_pois: bool, use_live_osrm: bool, theme: str = "Night", picks: str = ""):
+    """Run the full pipeline and return (map HTML, trip panel HTML).
+
+    ``picks`` is JSON {category: poi id} for stops the driver chose on the map;
+    a pick replaces the automatic best stop of its category while it is still
+    inside the corridor, and is ignored otherwise.
+    """
     started = time.perf_counter()
+    manual = parse_picks(picks)
     origin, how_o = data_loader.resolve_place(from_name)
     destination, how_d = data_loader.resolve_place(to_name)
     if origin is None or destination is None:
@@ -304,7 +321,7 @@ def plan_trip(from_name: str, to_name: str, categories: List[str], width_m: floa
                     "or type coordinates as <code>25.2, 55.27</code>." % html.escape(missing or ""))
     if haversine_m(origin, destination) < 200:
         return card("Start and destination are the same", "Pick two different places.")
-    categories = [c for c in (categories or []) if c in data_loader.CATEGORY_TAGS]
+    categories = [c for c in (categories or []) if c in data_loader.CATEGORY_TAGS][:data_loader.MAX_STOPS]
     if not categories:
         return card("Pick at least one stop type", "Tap one or more of the stop buttons, then Go.")
 
@@ -317,20 +334,36 @@ def plan_trip(from_name: str, to_name: str, categories: List[str], width_m: floa
 
     all_pois, poi_source = acquire_pois(categories, route, width_m, use_live_pois)
     projected = {cat: corridor.split(all_pois.get(cat, []), progress_m) for cat in categories}
+    nearest = {cat: radius_search(all_pois.get(cat, []), vehicle) for cat in categories}
+    rough = DetourCostEngine(HeuristicBackend())  # cheap offline pre-ranking, so a wide corridor stays fast
+    shortlist = {}
+    for cat in categories:
+        kept = projected[cat][0]
+        best = [r.candidate for r in rough.rank(vehicle, destination, kept, progress_m)[:MAX_COSTED]]
+        best += [c for c in kept if c.poi.id == manual.get(cat) and c not in best]
+        shortlist[cat] = best
     engine, cost_source = make_engine(use_live_osrm, [vehicle, destination] +
-                                      [c.poi.coord for kept, _ in projected.values() for c in kept])
+                                      [c.poi.coord for short in shortlist.values() for c in short] +
+                                      [hits[0][0].coord for hits in nearest.values() if hits])
 
     per_category: Dict[str, Dict] = {}
     for cat in categories:
         pois = all_pois.get(cat, [])
         kept, rejected = projected[cat]
-        ranked = engine.rank(vehicle, destination, kept, progress_m)
-        nearest = radius_search(pois, vehicle)
-        radius_pick = engine.evaluate(vehicle, destination, corridor.project(nearest[0][0]), progress_m) if nearest else None
-        per_category[cat] = {"pois": pois, "kept": kept, "rejected": rejected, "ranked": ranked, "radius": radius_pick}
+        ranked = engine.rank(vehicle, destination, shortlist[cat], progress_m)
+        hits = nearest[cat]
+        radius_pick = engine.evaluate(vehicle, destination, corridor.project(hits[0][0]), progress_m) if hits else None
+        choice = next((r for r in ranked if r.candidate.poi.id == manual.get(cat)), ranked[0] if ranked else None)
+        per_category[cat] = {"pois": pois, "kept": kept, "rejected": rejected, "ranked": ranked, "radius": radius_pick,
+                             "choice": choice, "manual": choice is not None and choice.candidate.poi.id == manual.get(cat)}
 
-    chosen = [d["ranked"][0].candidate for d in per_category.values() if d["ranked"]]
-    sequence = greedy_sequence(vehicle, destination, chosen, engine) if chosen else []
+    chosen = [d["choice"].candidate for d in per_category.values() if d["choice"]]
+    if len(chosen) > 1 and hasattr(engine.backend, "prefetch"):
+        try:  # every stop-to-stop time in one request, for the sequencer
+            engine.backend.prefetch([vehicle, destination] + [c.poi.coord for c in chosen])
+        except Exception:
+            pass  # the sequencer then asks leg by leg
+    sequence = best_sequence(vehicle, destination, chosen, engine) if chosen else []
     direct_s = engine.backend.route_time_s(vehicle, destination)
     elapsed = time.perf_counter() - started
 
@@ -345,6 +378,7 @@ def plan_trip(from_name: str, to_name: str, categories: List[str], width_m: floa
         "road_live": route_source.startswith("live"), "pois_live": poi_source.startswith("live"),
         "route_source": route_source, "poi_source": poi_source, "cost_source": cost_source,
         "how": (how_o, how_d), "elapsed": elapsed, "stops": ordered,
+        "picked": {d["choice"].candidate.poi.id for d in per_category.values() if d["manual"]},
     }
     th = THEMES.get(theme, THEMES["Night"])
     fmap = build_folium_map(route, corridor, progress_m, per_category, sequence, trip_path, steps, trip, th)
@@ -378,17 +412,49 @@ def poi_pin(category: str, size: int = 30, number: int = 0, glow: bool = False) 
 
 
 def car_icon(heading: float) -> folium.DivIcon:
-    """A black muscle car seen from above (Dodge Challenger style), turned to the direction of travel."""
-    svg = ('<svg width="30" height="54" viewBox="0 0 30 54" style="transform:rotate({h:.0f}deg);'
-           'filter:drop-shadow(0 3px 5px rgba(0,0,0,.55))">'
-           '<rect x="2" y="2" width="26" height="50" rx="8" fill="#111" stroke="#fff" stroke-width="1.6"/>'
-           '<rect x="11" y="3" width="3" height="48" fill="#3a3a3c"/><rect x="16" y="3" width="3" height="48" fill="#3a3a3c"/>'
-           '<path d="M6 17 Q15 12 24 17 L23 24 L7 24 Z" fill="#7fb3d5" opacity=".85"/>'
-           '<path d="M7 36 L23 36 L24 42 Q15 45 6 42 Z" fill="#7fb3d5" opacity=".7"/>'
-           '<rect x="4" y="3" width="6" height="3" rx="1.5" fill="#fff8c4"/><rect x="20" y="3" width="6" height="3" rx="1.5" fill="#fff8c4"/>'
-           '<rect x="4" y="48" width="7" height="2.6" rx="1.3" fill="#ff3b30"/><rect x="19" y="48" width="7" height="2.6" rx="1.3" fill="#ff3b30"/>'
-           '</svg>').format(h=heading)
-    return folium.DivIcon(html='<div style="width:30px;height:54px">%s</div>' % svg, icon_size=(30, 54), icon_anchor=(15, 27))
+    """A dark grey muscle car seen from above (long hood, twin scoops, rear spoiler), turned to the direction of travel."""
+    svg = ('<svg width="36" height="66" viewBox="0 0 40 72" style="transform:rotate({h:.0f}deg);filter:drop-shadow(0 0 1.2px rgba(255,255,255,.7)) drop-shadow(0 3px 5px rgba(0,0,0,.6))">'
+           '<defs>'
+           '<linearGradient id="srBody" x1="0" x2="1"><stop offset="0" stop-color="#26282c"/><stop offset=".2" stop-color="#4a4d53"/><stop offset=".5" stop-color="#686c73"/><stop offset=".8" stop-color="#4a4d53"/><stop offset="1" stop-color="#26282c"/></linearGradient>'
+           '<linearGradient id="srGlass" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2a2e35"/><stop offset="1" stop-color="#07080a"/></linearGradient>'
+           '<linearGradient id="srHood" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7a7e86" stop-opacity=".0"/><stop offset=".5" stop-color="#8a8e96" stop-opacity=".35"/><stop offset="1" stop-color="#7a7e86" stop-opacity=".0"/></linearGradient>'
+           '</defs>'
+           '<rect x="1.6" y="10" width="3.4" height="10" rx="1.4" fill="#0c0c0d"/><rect x="35" y="10" width="3.4" height="10" rx="1.4" fill="#0c0c0d"/>'
+           '<rect x="1.4" y="52" width="3.6" height="11" rx="1.4" fill="#0c0c0d"/><rect x="35" y="52" width="3.6" height="11" rx="1.4" fill="#0c0c0d"/>'
+           '<path d="M3 35.2 L0.8 34.4 Q0.2 33 1.2 32.2 L3.6 32 Z" fill="#3b3e43" stroke="#151618" stroke-width=".5"/>'
+           '<path d="M37 35.2 L39.2 34.4 Q39.8 33 38.8 32.2 L36.4 32 Z" fill="#3b3e43" stroke="#151618" stroke-width=".5"/>'
+           '<path d="M8 3.6 Q20 1 32 3.6 Q36.4 5.6 36.6 11 Q37.4 14 36.6 22 L36.4 34 Q37.6 42 37.2 50 Q37.6 55 36.4 62 Q35.6 69.2 28 70.2 L12 70.2 Q4.4 69.2 3.6 62 Q2.4 55 2.8 50 Q2.4 42 3.6 34 L3.4 22 Q2.6 14 3.4 11 Q3.6 5.6 8 3.6 Z" fill="url(#srBody)" stroke="#111214" stroke-width="1"/>'
+           '<path d="M6.4 4.6 Q20 2 33.6 4.6 L34.4 7.4 Q20 5.4 5.6 7.4 Z" fill="#0f1012"/>'
+           '<path d="M12 5.4 Q20 4.4 28 5.4 L28 6.6 Q20 5.8 12 6.6 Z" fill="#26282c"/>'
+           '<path d="M13 5.6 L27 5.6 M13 6.2 L27 6.2" stroke="#3d4046" stroke-width=".25"/>'
+           '<rect x="5.8" y="5.2" width="5.4" height="2.4" rx="1.2" fill="#1b1d20" stroke="#e9eef5" stroke-width=".6"/><circle cx="8.5" cy="6.4" r=".7" fill="#fff"/>'
+           '<rect x="28.8" y="5.2" width="5.4" height="2.4" rx="1.2" fill="#1b1d20" stroke="#e9eef5" stroke-width=".6"/><circle cx="31.5" cy="6.4" r=".7" fill="#fff"/>'
+           '<path d="M7 2.2 Q20 0 33 2.2" stroke="#0a0a0b" stroke-width="1" fill="none"/>'
+           '<path d="M8.6 8.4 L10 31 M31.4 8.4 L30 31" stroke="#1d1f22" stroke-width=".55" fill="none"/>'
+           '<path d="M15.6 8.2 L24.4 8.2 L25 30.2 L15 30.2 Z" fill="url(#srHood)" stroke="#2c2e32" stroke-width=".45"/>'
+           '<path d="M20 8.6 L20 29.6" stroke="#9ea2a9" stroke-width=".35" opacity=".45"/>'
+           '<rect x="10" y="15.6" width="6.8" height="4" rx="1.8" fill="#0c0d0f" stroke="#7a7e85" stroke-width=".4"/>'
+           '<rect x="23.2" y="15.6" width="6.8" height="4" rx="1.8" fill="#0c0d0f" stroke="#7a7e85" stroke-width=".4"/>'
+           '<path d="M11.4 17 L15.4 17 M11.4 18.2 L15.4 18.2 M24.6 17 L28.6 17 M24.6 18.2 L28.6 18.2" stroke="#34373c" stroke-width=".45"/>'
+           '<path d="M7.4 32.6 Q20 29 32.6 32.6 L30.6 42.4 Q20 41 9.4 42.4 Z" fill="url(#srGlass)" stroke="#0b0c0d" stroke-width=".7"/>'
+           '<path d="M11 34 Q16 32.4 20.6 32.2 L15.4 41.2 Q12.8 41.4 10.6 41.8 Z" fill="#fff" opacity=".09"/>'
+           '<path d="M11.2 41.4 L18.4 37.4 M21 41.2 L28.2 37.4" stroke="#0a0a0b" stroke-width=".6" stroke-linecap="round"/>'
+           '<path d="M5.8 39.6 L8.6 43.2 L8.6 54.4 L6.2 57.2 Z" fill="#0d0e10"/><path d="M34.2 39.6 L31.4 43.2 L31.4 54.4 L33.8 57.2 Z" fill="#0d0e10"/>'
+           '<path d="M6 47.6 L8.6 47.6 M31.4 47.6 L34 47.6" stroke="#4d5056" stroke-width=".5"/>'
+           '<path d="M9.8 42.9 Q20 41.6 30.2 42.9 L30.2 54.2 Q20 55.2 9.8 54.2 Z" fill="#5a5e65" stroke="#2a2c30" stroke-width=".5"/>'
+           '<path d="M13 44 Q20 43.2 27 44 L27 52.8 Q20 53.4 13 52.8 Z" fill="#fff" opacity=".06"/>'
+           '<circle cx="29" cy="45" r=".5" fill="#1a1b1e"/>'
+           '<path d="M9.6 55.2 Q20 56.4 30.4 55.2 L31.6 61 Q20 62.6 8.4 61 Z" fill="url(#srGlass)" stroke="#0b0c0d" stroke-width=".6"/>'
+           '<path d="M12 57 L28 57 M12 58.6 L28 58.6" stroke="#8a2a26" stroke-width=".25" opacity=".7"/>'
+           '<circle cx="34.8" cy="58.8" r="1" fill="#34373c" stroke="#16171a" stroke-width=".4"/>'
+           '<path d="M5.6 64.8 Q20 66.8 34.4 64.8 L34.8 67.2 Q20 69.4 5.2 67.2 Z" fill="#0f1012"/>'
+           '<rect x="5" y="64.2" width="2" height="3.4" rx=".6" fill="#0f1012"/><rect x="33" y="64.2" width="2" height="3.4" rx=".6" fill="#0f1012"/>'
+           '<rect x="6.4" y="62.4" width="7" height="1.7" rx=".85" fill="#ff3b30"/><rect x="26.6" y="62.4" width="7" height="1.7" rx=".85" fill="#ff3b30"/>'
+           '<rect x="15.4" y="62.6" width="9.2" height="1.3" rx=".6" fill="#b3261e" opacity=".85"/>'
+           '<circle cx="13" cy="70.4" r="1" fill="#1a1b1e" stroke="#9ea2a9" stroke-width=".5"/><circle cx="27" cy="70.4" r="1" fill="#1a1b1e" stroke="#9ea2a9" stroke-width=".5"/>'
+           '</svg>'
+           ).replace("{h:.0f}", "%.0f" % heading)
+    return folium.DivIcon(html='<div style="width:36px;height:66px">%s</div>' % svg, icon_size=(36, 66), icon_anchor=(18, 33))
 
 
 def place_pin(kind: str) -> folium.DivIcon:
@@ -448,7 +514,33 @@ def map_css(th: dict) -> str:
 .sr-legend{position:fixed;left:16px;bottom:18px;z-index:9998;background:%(card)s;color:%(text)s;border-radius:14px;padding:8px 12px;
   box-shadow:0 3px 12px rgba(0,0,0,.3);font:600 11.5px/1.9 %(font)s}
 .sr-legend i{display:inline-block;vertical-align:middle;margin-right:6px}
+.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:%(card)s!important;color:%(text)s!important;box-shadow:0 6px 20px rgba(0,0,0,.4)!important}
+.leaflet-popup-content-wrapper{border-radius:16px!important}
+.leaflet-popup-content{margin:12px 14px!important;font:500 12.5px/1.4 %(font)s}
+.sr-pick b{display:block;font:700 14px/1.3 %(font)s;margin-bottom:2px}
+.sr-pick span{color:%(sub)s}
+.sr-pick button{display:block;width:100%%;margin-top:10px;padding:9px 12px;border:none;border-radius:999px;cursor:pointer;
+  background:#0a84ff;color:#fff;font:700 13px %(font)s}
+.sr-pick button.back{background:%(line)s;color:%(text)s;border:1px solid %(sub)s}
 </style>""" % dict(th, font=UI_FONT)
+
+
+def parse_picks(picks: str) -> Dict[str, str]:
+    """{category: poi id} from the hidden picks box; anything malformed counts as no picks."""
+    try:
+        data = json.loads(picks or "{}")
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in data.items() if v} if isinstance(data, dict) else {}
+
+
+def pick_popup(c: CorridorCandidate, r, label: str, poi_id: Optional[str]) -> folium.Popup:
+    """A card on a stop pin whose button tells the page to choose (or un-choose) that stop."""
+    msg = json.dumps({"srPick": {"cat": c.poi.category, "id": poi_id}})
+    detail = "+%.1f min &middot; %.0f m from the route" % (r.detour_min, c.cross_track_m) if r else "Your chosen %s" % CATEGORY_LABELS[c.poi.category].lower()
+    body = ('<div class="sr-pick"><b>%s %s</b><span>%s</span><button class="%s" onclick=\'parent.postMessage(%s, "*")\'>%s</button></div>'
+            % (CATEGORY_ICONS[c.poi.category], html.escape(c.poi.name), detail, "" if poi_id else "back", html.escape(msg, quote=False), label))
+    return folium.Popup(body, max_width=260)
 
 
 def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_path, steps: List[Step],
@@ -461,7 +553,7 @@ def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_p
 
     # the Smart Corridor, a faint band along the route
     band = folium.FeatureGroup(name="Corridor")
-    for p in corridor_circle_points(route):
+    for p in corridor_circle_points(route, max(CORRIDOR_CIRCLE_SPACING_M, corridor.corridor_width_m)):
         folium.Circle(p, radius=corridor.corridor_width_m, stroke=False, fill=True, fill_color=th["band"], fill_opacity=0.10).add_to(band)
     band.add_to(fmap)
 
@@ -482,22 +574,24 @@ def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_p
     # candidates: filtered out (small grey dots), inside the corridor (pins), suggested (big numbered pins)
     chosen = {c.poi.id: i + 1 for i, c in enumerate(trip["stops"])}
     for cat, d in per_category.items():
-        for c in d["rejected"]:
+        for c in sorted(d["rejected"], key=lambda c: c.cross_track_m)[:MAX_GREY_DOTS]:
             folium.CircleMarker(c.poi.coord, radius=5, color="#ffffff", weight=1.5, fill=True, fill_color=FILTERED_COLOR, fill_opacity=0.85,
                                 tooltip=tip("%s<br><span style='opacity:.7'>Filtered out: %s &middot; %.0f m from the route</span>"
                                             % (html.escape(c.poi.name), corridor_reason(c, corridor, progress_m) or "excluded", c.cross_track_m))).add_to(fmap)
-        detour = {id(r.candidate): r for r in d["ranked"]}
-        for c in d["kept"]:
+        for r in d["ranked"]:  # the costed shortlist; with a wide corridor, not every place inside it
+            c = r.candidate
             if c.poi.id in chosen:
                 continue
-            r = detour.get(id(c))
             folium.Marker(c.poi.coord, icon=poi_pin(cat, 26),
-                          tooltip=tip("%s<br><span style='opacity:.7'>+%.1f min &middot; %.0f m from the route</span>"
-                                      % (html.escape(c.poi.name), r.detour_min if r else 0, c.cross_track_m))).add_to(fmap)
+                          tooltip=tip("%s<br><span style='opacity:.7'>+%.1f min &middot; %.0f m from the route &middot; tap to choose</span>"
+                                      % (html.escape(c.poi.name), r.detour_min if r else 0, c.cross_track_m)),
+                          popup=pick_popup(c, r, "Use this stop", c.poi.id)).add_to(fmap)
     for c in trip["stops"]:
         n = chosen[c.poi.id]
+        mine = c.poi.id in trip["picked"]
         folium.Marker(c.poi.coord, icon=poi_pin(c.poi.category, 40, n, glow=True), z_index_offset=1000,
-                      tooltip=name_tag("%d. %s" % (n, c.poi.name), th)).add_to(fmap)
+                      tooltip=name_tag("%d. %s%s" % (n, c.poi.name, " (your pick)" if mine else ""), th),
+                      popup=pick_popup(c, None, "Back to automatic", None) if mine else None).add_to(fmap)
 
     folium.Marker(route[0], icon=place_pin("start"), tooltip=name_tag(trip["from"], th)).add_to(fmap)
     folium.Marker(route[-1], icon=place_pin("end"), z_index_offset=900, tooltip=name_tag(trip["to"], th)).add_to(fmap)
@@ -536,8 +630,8 @@ def status_pill(trip: dict) -> str:
         dot, text, note = "#ff9f0a", "OFFLINE &middot; approximate roads", trip["route_source"]
     reason = note.split(" - ", 1)[1] if " - " in note else ""
     extra = '<div class="sr-why">%s</div>' % html.escape(reason) if reason else ""
-    return ('<div class="sr-status"><div><i style="background:%s"></i> %s &middot; %.0f m corridor</div>%s</div>'
-            % (dot, text, trip["width_m"], extra))
+    return ('<div class="sr-status"><div><i style="background:%s"></i> %s &middot; %s corridor</div>%s</div>'
+            % (dot, text, km(trip["width_m"]), extra))
 
 
 def legend(per_category, th, trip) -> str:
@@ -590,16 +684,23 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
         for i, c in enumerate(trip["stops"]):
             r = ranked_of.get(c.poi.id)
             items.append('<div class="sr-stop"><div class="sr-ic" style="background:%s">%s<b>%d</b></div><div class="sr-grow">'
-                         '<div class="sr-name">%s</div><div class="sr-sub">%s ahead &middot; %.0f m off the road</div></div>'
+                         '<div class="sr-name">%s%s</div><div class="sr-sub">%s ahead &middot; %.0f m off the road</div></div>'
                          '<div class="sr-add">+%.1f<small>min</small></div></div>'
                          % (CATEGORY_COLORS[c.poi.category], CATEGORY_ICONS[c.poi.category], i + 1, html.escape(c.poi.name),
+                            ' <span class="sr-mine">your pick</span>' if c.poi.id in trip["picked"] else "",
                             km(max(0.0, c.along_track_m - trip["progress_m"])), c.cross_track_m, r.detour_min if r else 0))
-        out.append('<div class="sr-card"><div class="sr-h">Stops on your way</div>%s</div>' % "".join(items))
+        out.append('<div class="sr-card"><div class="sr-h">Stops on your way</div>%s<div class="sr-sub sr-hint">'
+                   'Tap any pin inside the corridor on the map to choose that stop instead.</div></div>' % "".join(items))
+    if not trip["pois_live"] and " - " in trip["poi_source"]:
+        out.append('<div class="sr-card sr-warn"><div class="sr-name">Sample stops - not real places</div>'
+                   '<div class="sr-sub">The live OpenStreetMap places search did not work, so these stops come from the '
+                   'offline sample and may not sit on your real road. Reason: %s.<br>Press Go again to retry; places '
+                   'that load once are kept for a week.</div></div>' % html.escape(trip["poi_source"].split(" - ", 1)[1]))
     missing = [cat for cat, d in per_category.items() if not d["ranked"]]
     if missing:
-        out.append('<div class="sr-card sr-warn"><div class="sr-name">No %s within %.0f m of the route ahead</div>'
-                   '<div class="sr-sub">Widen the corridor in Route settings to search further from the road.</div></div>'
-                   % (" or ".join(CATEGORY_LABELS[c].lower() for c in missing), trip["width_m"]))
+        out.append('<div class="sr-card sr-warn"><div class="sr-name">No %s within %s of the route ahead</div>'
+                   '<div class="sr-sub">Widen the corridor with the <b>Corridor width</b> slider above to search further from the road.</div></div>'
+                   % (" or ".join(CATEGORY_LABELS[c].lower() for c in missing), km(trip["width_m"])))
 
     # directions
     rows = []
@@ -618,12 +719,12 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
     # the evidence: corridor vs radius, per stop type (collapsed)
     det = []
     for cat, d in per_category.items():
-        det.append('<div class="sr-name" style="margin-top:10px">%s %s &middot; %d found, %d inside the %.0f m corridor</div>'
-                   % (CATEGORY_ICONS[cat], CATEGORY_LABELS[cat], len(d["pois"]), len(d["kept"]), trip["width_m"]))
+        det.append('<div class="sr-name" style="margin-top:10px">%s %s &middot; %d found, %d inside the %s corridor</div>'
+                   % (CATEGORY_ICONS[cat], CATEGORY_LABELS[cat], len(d["pois"]), len(d["kept"]), km(trip["width_m"])))
         if d["ranked"]:
             det.append('<table class="sr-t"><tr><th>Stop</th><th>Added</th><th>Off route</th><th>Where</th></tr>%s</table>'
                        % "".join('<tr><td>%s%s</td><td>+%.1f min</td><td>%.0f m</td><td>%s</td></tr>'
-                                 % ("&#9733; " if i == 0 else "", html.escape(r.candidate.poi.name), r.detour_min,
+                                 % ("&#9733; " if r is d["choice"] else "", html.escape(r.candidate.poi.name), r.detour_min,
                                     r.candidate.cross_track_m, where_text(r.candidate, trip["progress_m"]))
                                  for i, r in enumerate(d["ranked"][:5])))
         rp = d["radius"]
@@ -743,6 +844,11 @@ details summary.sr-h { cursor: pointer; margin-bottom: 0; }
   font: 800 12px/20px %(font)s; text-align: center; }
 .sr-grow { flex: 1; min-width: 0; color: #e5e5ea; font-size: 14px; }
 .sr-add { color: #30d158; font: 800 20px %(font)s; text-align: right; } .sr-add small { font-size: 11px; margin-left: 2px; }
+.sr-hidden { display: none !important; }
+.sr-mine { font: 700 10.5px %(font)s; color: #0a84ff; background: rgba(10,132,255,.15); padding: 2px 7px; border-radius: 999px;
+  margin-left: 4px; vertical-align: 1px; text-transform: uppercase; letter-spacing: .04em; }
+.sr-hint { margin-top: 8px; font-size: 12px; opacity: .8; }
+#reset-picks { margin: 6px 0 4px; border-radius: 999px !important; }
 .sr-arrow { flex: none; width: 34px; height: 34px; border-radius: 10px; background: #3a3a3c; display: grid; place-items: center; color: #fff; }
 .sr-dstop .sr-arrow { background: #1f9d49; }
 .sr-km { color: #aeaeb2; font: 700 13px %(font)s; }
@@ -761,6 +867,19 @@ PAGE_JS = """() => {
     if (el) el.textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: false});
   };
   tick(); setInterval(tick, 5000);
+  // "Use this stop" / "Back to automatic" on a map pin: update the picks box and re-plan
+  window.addEventListener('message', (e) => {
+    const p = e.data && e.data.srPick;
+    const box = document.querySelector('#picks textarea');
+    const apply = document.getElementById('apply-pick');
+    if (!p || !box || !apply) return;
+    let picks = {};
+    try { picks = JSON.parse(box.value || '{}') || {}; } catch (_) {}
+    if (p.id) picks[p.cat] = p.id; else delete picks[p.cat];
+    box.value = JSON.stringify(picks);
+    box.dispatchEvent(new Event('input', {bubbles: true}));
+    setTimeout(() => apply.click(), 60);
+  });
 }"""
 
 STATUS = """<div id="status"><span id="clock">--:--</span><small>&#9679;&#9679;&#9679;&#9675; 5G</small></div>"""
@@ -794,31 +913,37 @@ def make_ui() -> gr.Blocks:
             with gr.Column(scale=3, min_width=350, elem_id="panel"):
                 with gr.Tabs(elem_id="tabs", selected="drive") as tabs:
                     with gr.Tab("Drive", id="drive"):
+                        width = gr.Slider(50, MAX_CORRIDOR_M, value=150, step=50, label="Corridor width (m)", elem_id="width",
+                                          info="How far from the road a stop may be, up to 3 km")
                         result = gr.HTML()
+                        reset_picks = gr.Button("\u21BA  Use automatic stops", elem_id="reset-picks", size="sm")
+                        # stops chosen on the map, as JSON {category: poi id}; filled in by PAGE_JS
+                        picks = gr.Textbox("", elem_id="picks", elem_classes="sr-hidden", show_label=False, container=False)
+                        apply_pick = gr.Button("apply", elem_id="apply-pick", elem_classes="sr-hidden")
                     with gr.Tab("Where to", id="where"):
                         origin = gr.Dropdown(places, value=DEFAULT_FROM, label="From", allow_custom_value=True,
                                              elem_id="from-box", info="Pick a place, type a name, or type lat, lon")
                         swap = gr.Button("⇅  Swap", elem_id="swap")
                         destination = gr.Dropdown(places, value=DEFAULT_TO, label="To", allow_custom_value=True, elem_id="to-box")
-                        categories = gr.CheckboxGroup(cat_choices, value=["mosque", "supermarket"], label="Stops on the way",
+                        categories = gr.CheckboxGroup(cat_choices, value=["mosque", "supermarket"], label="Stops on the way (up to %d)" % data_loader.MAX_STOPS,
                                                       elem_id="cats")
                         run = gr.Button("Go", variant="primary", elem_id="go")
                     with gr.Tab("Settings", id="settings"):
-                        width = gr.Slider(50, 500, value=150, step=10, label="Corridor width (m)",
-                                          info="How far from the road a stop may be")
                         progress = gr.Slider(0, 60, value=0, step=0.5, label="Distance already driven (km)",
                                              info="Stops more than 250 m behind you are left out")
                         live_pois = gr.Checkbox(value=True, label="Live places from OpenStreetMap (Overpass)")
                         live_osrm = gr.Checkbox(value=True, label="Live roads and times (OSRM)")
                         look = gr.Radio(["Night", "Day"], value="Night", label="Map style")
 
-        inputs = [origin, destination, categories, width, progress, live_pois, live_osrm, look]
+        inputs = [origin, destination, categories, width, progress, live_pois, live_osrm, look, picks]
         outputs = [map_html, result]
         to_drive = lambda: gr.Tabs(selected="drive")
         run.click(plan_trip, inputs, outputs).then(to_drive, None, tabs)
         go_home.click(lambda: (office, home), None, [origin, destination]).then(plan_trip, inputs, outputs).then(to_drive, None, tabs)
         go_work.click(lambda: (home, office), None, [origin, destination]).then(plan_trip, inputs, outputs).then(to_drive, None, tabs)
         swap.click(lambda a, b: (b, a), [origin, destination], [origin, destination])
+        apply_pick.click(plan_trip, inputs, outputs)
+        reset_picks.click(lambda: "", None, picks).then(plan_trip, inputs, outputs)
         flip.click(lambda t: "Day" if t == "Night" else "Night", look, look).then(plan_trip, inputs, outputs)
         for control in (width, progress, live_pois, live_osrm, look):
             control.input(plan_trip, inputs, outputs)
