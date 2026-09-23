@@ -1,0 +1,11 @@
+# Core pipeline, tests and benchmark need only the Python standard library.
+# These are for the dashboard (gradio, folium), live routing/data (requests)
+# and the OSMnx live-graph path (osmnx, networkx, geopy).
+osmnx>=1.9
+networkx>=2.8
+folium>=0.14
+gradio>=4.0,<5    # Gradio 5 needs Python 3.10+; 4.x supports Python 3.9
+huggingface_hub<1.0   # Gradio 4 imports HfFolder, removed in huggingface_hub 1.0
+requests>=2.28
+urllib3<2            # macOS system Python 3.9 is built on LibreSSL, which urllib3 2.x does not support
+geopy>=2.3
