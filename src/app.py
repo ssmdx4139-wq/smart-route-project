@@ -304,12 +304,13 @@ def card(title: str, body: str) -> Tuple[str, str]:
 
 
 def plan_trip(from_name: str, to_name: str, categories: List[str], width_m: float, progress_km: float,
-              use_live_pois: bool, use_live_osrm: bool, theme: str = "Night", picks: str = ""):
+              use_live_pois: bool, use_live_osrm: bool, theme: str = "Night", picks: str = "", navigating: bool = False):
     """Run the full pipeline and return (map HTML, trip panel HTML).
 
     ``picks`` is JSON {category: poi id} for stops the driver chose on the map;
     a pick replaces the automatic best stop of its category while it is still
-    inside the corridor, and is ignored otherwise.
+    inside the corridor, and is ignored otherwise. While ``navigating`` (after
+    Go) the map shows only the chosen stops; otherwise every candidate can be tapped.
     """
     started = time.perf_counter()
     manual = parse_picks(picks)
@@ -379,6 +380,7 @@ def plan_trip(from_name: str, to_name: str, categories: List[str], width_m: floa
         "route_source": route_source, "poi_source": poi_source, "cost_source": cost_source,
         "how": (how_o, how_d), "elapsed": elapsed, "stops": ordered,
         "picked": {d["choice"].candidate.poi.id for d in per_category.values() if d["manual"]},
+        "navigating": bool(navigating),
     }
     th = THEMES.get(theme, THEMES["Night"])
     fmap = build_folium_map(route, corridor, progress_m, per_category, sequence, trip_path, steps, trip, th)
@@ -572,8 +574,9 @@ def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_p
                         tooltip=tip("Your drive via the stops")).add_to(fmap)
 
     # candidates: filtered out (small grey dots), inside the corridor (pins), suggested (big numbered pins)
+    # once driving (after Go), only the chosen stops are shown
     chosen = {c.poi.id: i + 1 for i, c in enumerate(trip["stops"])}
-    for cat, d in per_category.items():
+    for cat, d in ({} if trip["navigating"] else per_category).items():
         for c in sorted(d["rejected"], key=lambda c: c.cross_track_m)[:MAX_GREY_DOTS]:
             folium.CircleMarker(c.poi.coord, radius=5, color="#ffffff", weight=1.5, fill=True, fill_color=FILTERED_COLOR, fill_opacity=0.85,
                                 tooltip=tip("%s<br><span style='opacity:.7'>Filtered out: %s &middot; %.0f m from the route</span>"
@@ -591,7 +594,7 @@ def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_p
         mine = c.poi.id in trip["picked"]
         folium.Marker(c.poi.coord, icon=poi_pin(c.poi.category, 40, n, glow=True), z_index_offset=1000,
                       tooltip=name_tag("%d. %s%s" % (n, c.poi.name, " (your pick)" if mine else ""), th),
-                      popup=pick_popup(c, None, "Back to automatic", None) if mine else None).add_to(fmap)
+                      popup=pick_popup(c, None, "Back to automatic", None) if mine and not trip["navigating"] else None).add_to(fmap)
 
     folium.Marker(route[0], icon=place_pin("start"), tooltip=name_tag(trip["from"], th)).add_to(fmap)
     folium.Marker(route[-1], icon=place_pin("end"), z_index_offset=900, tooltip=name_tag(trip["to"], th)).add_to(fmap)
@@ -638,8 +641,9 @@ def legend(per_category, th, trip) -> str:
     dot = '<i style="width:10px;height:10px;border-radius:50%%;background:%s"></i>%s'
     rows = ['<i style="width:18px;height:5px;border-radius:3px;background:%s"></i>Route' % th["route"] if trip["road_live"] else
             '<i style="width:18px;height:0;border-top:4px dashed %s"></i>Approx. route' % th["route"],
-            '<i style="width:18px;height:0;border-top:3px dotted %s"></i>Your drive' % TRIP_COLOR,
-            dot % (FILTERED_COLOR, "Filtered out")]
+            '<i style="width:18px;height:0;border-top:3px dotted %s"></i>Your drive' % TRIP_COLOR]
+    if not trip["navigating"]:
+        rows.append(dot % (FILTERED_COLOR, "Filtered out"))
     rows += [dot % (CATEGORY_COLORS[c], CATEGORY_LABELS[c]) for c in per_category]
     return '<div class="sr-legend">%s</div>' % "<br>".join(rows)
 
@@ -689,8 +693,10 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
                          % (CATEGORY_COLORS[c.poi.category], CATEGORY_ICONS[c.poi.category], i + 1, html.escape(c.poi.name),
                             ' <span class="sr-mine">your pick</span>' if c.poi.id in trip["picked"] else "",
                             km(max(0.0, c.along_track_m - trip["progress_m"])), c.cross_track_m, r.detour_min if r else 0))
-        out.append('<div class="sr-card"><div class="sr-h">Stops on your way</div>%s<div class="sr-sub sr-hint">'
-                   'Tap any pin inside the corridor on the map to choose that stop instead.</div></div>' % "".join(items))
+        hint = ("Press <b>Cancel</b> to choose different stops." if trip["navigating"] else
+                "Tap any pin inside the corridor on the map to choose that stop instead, then press <b>Go</b>.")
+        out.append('<div class="sr-card"><div class="sr-h">Stops on your way</div>%s<div class="sr-sub sr-hint">%s</div></div>'
+                   % ("".join(items), hint))
     if not trip["pois_live"] and " - " in trip["poi_source"]:
         out.append('<div class="sr-card sr-warn"><div class="sr-name">Sample stops - not real places</div>'
                    '<div class="sr-sub">The live OpenStreetMap places search did not work, so these stops come from the '
@@ -817,7 +823,7 @@ footer { display: none !important; }
 #cats label.selected { background: #0a84ff !important; border-color: #64d2ff !important; }
 #cats label span { color: inherit !important; } #cats label.selected, #cats label.selected span { color: #fff !important; }
 #cats input { display: none !important; }
-#go { background: linear-gradient(145deg, #4cd964, #1f9d49) !important; color: #fff !important; font-size: 20px !important;
+#go, #start { background: linear-gradient(145deg, #4cd964, #1f9d49) !important; color: #fff !important; font-size: 20px !important;
   font-weight: 800 !important; border-radius: 20px !important; padding: 16px !important; border: none !important;
   box-shadow: 0 8px 22px rgba(48,209,88,.32); letter-spacing: .01em; margin-top: 6px; }
 #panel input[type=checkbox] { width: 20px !important; height: 20px !important; border-radius: 6px !important; }
@@ -849,6 +855,9 @@ details summary.sr-h { cursor: pointer; margin-bottom: 0; }
   margin-left: 4px; vertical-align: 1px; text-transform: uppercase; letter-spacing: .04em; }
 .sr-hint { margin-top: 8px; font-size: 12px; opacity: .8; }
 #reset-picks { margin: 6px 0 4px; border-radius: 999px !important; }
+#start { margin: 0 0 10px; }
+#cancel { background: #3a1a1a !important; color: #ff453a !important; border: 2px solid #ff453a !important; border-radius: 20px !important;
+  font: 800 17px %(font)s !important; padding: 13px !important; margin: 0 0 10px; }
 .sr-arrow { flex: none; width: 34px; height: 34px; border-radius: 10px; background: #3a3a3c; display: grid; place-items: center; color: #fff; }
 .sr-dstop .sr-arrow { background: #1f9d49; }
 .sr-km { color: #aeaeb2; font: 700 13px %(font)s; }
@@ -915,6 +924,9 @@ def make_ui() -> gr.Blocks:
                     with gr.Tab("Drive", id="drive"):
                         width = gr.Slider(50, MAX_CORRIDOR_M, value=150, step=50, label="Corridor width (m)", elem_id="width",
                                           info="How far from the road a stop may be, up to 3 km")
+                        # Go shows only the chosen stops; Cancel brings every candidate back to choose from
+                        start = gr.Button("\u25B6  Go with these stops", elem_id="start")
+                        cancel = gr.Button("\u2715  Cancel \u00B7 choose stops again", elem_id="cancel", visible=False)
                         result = gr.HTML()
                         reset_picks = gr.Button("\u21BA  Use automatic stops", elem_id="reset-picks", size="sm")
                         # stops chosen on the map, as JSON {category: poi id}; filled in by PAGE_JS
@@ -935,12 +947,19 @@ def make_ui() -> gr.Blocks:
                         live_osrm = gr.Checkbox(value=True, label="Live roads and times (OSRM)")
                         look = gr.Radio(["Night", "Day"], value="Night", label="Map style")
 
-        inputs = [origin, destination, categories, width, progress, live_pois, live_osrm, look, picks]
+        navigating = gr.State(False)
+        inputs = [origin, destination, categories, width, progress, live_pois, live_osrm, look, picks, navigating]
         outputs = [map_html, result]
         to_drive = lambda: gr.Tabs(selected="drive")
-        run.click(plan_trip, inputs, outputs).then(to_drive, None, tabs)
-        go_home.click(lambda: (office, home), None, [origin, destination]).then(plan_trip, inputs, outputs).then(to_drive, None, tabs)
-        go_work.click(lambda: (home, office), None, [origin, destination]).then(plan_trip, inputs, outputs).then(to_drive, None, tabs)
+        # (navigating, Go button, Cancel button, "Use automatic stops") for driving or choosing
+        mode = [navigating, start, cancel, reset_picks]
+        drive = lambda: (True, gr.Button(visible=False), gr.Button(visible=True), gr.Button(visible=False))
+        choose = lambda: (False, gr.Button(visible=True), gr.Button(visible=False), gr.Button(visible=True))
+        run.click(drive, None, mode).then(plan_trip, inputs, outputs).then(to_drive, None, tabs)
+        start.click(drive, None, mode).then(plan_trip, inputs, outputs)
+        cancel.click(choose, None, mode).then(plan_trip, inputs, outputs)
+        go_home.click(lambda: (office, home), None, [origin, destination]).then(drive, None, mode).then(plan_trip, inputs, outputs).then(to_drive, None, tabs)
+        go_work.click(lambda: (home, office), None, [origin, destination]).then(drive, None, mode).then(plan_trip, inputs, outputs).then(to_drive, None, tabs)
         swap.click(lambda a, b: (b, a), [origin, destination], [origin, destination])
         apply_pick.click(plan_trip, inputs, outputs)
         reset_picks.click(lambda: "", None, picks).then(plan_trip, inputs, outputs)
