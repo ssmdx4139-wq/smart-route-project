@@ -12,9 +12,11 @@ list panel (Drive / Where to / Settings) on the right.
 
 Controls
   * From / To          - pick a Dubai place, type a place name, or type "lat, lon" (FR1)
-  * Stops on the way   - one or more categories; several are ordered greedily (FR7)
-  * Corridor width     - 50-500 m half-width of the Smart Corridor (FR3, FR9)
-  * Distance into trip - where the vehicle is now; stops behind it are excluded (FR4)
+  * Stops on the way   - up to nine categories, visited in the quicker of greedy or route order (FR7)
+  * Map pins           - tap a pin inside the corridor to choose that stop instead of the automatic one
+  * Go / Cancel        - Go shows only the chosen stops; Cancel brings every candidate back to choose from
+  * Corridor width     - 50 m to 3 km half-width of the Smart Corridor (FR3, FR9)
+  * Distance already driven - where the vehicle is now; stops behind it are excluded (FR4)
   * Live data toggles  - Overpass POIs and OSRM routing, with labelled fallbacks (FR9, NFR5)
 
 Live calls that fail fall back to the offline data and the heuristic cost
@@ -745,9 +747,6 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
     return "".join(out)
 
 
-# ---------------------------------------------------------------------------
-# Interface: CarPlay-style dock, full-height map, panel of big controls
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Interface: SmartRoute running on a CarPlay head unit
 # ---------------------------------------------------------------------------

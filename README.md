@@ -101,19 +101,22 @@ Controls:
   or type coordinates as `25.2, 55.27`. The ⇅ button swaps them.
 * **Stops on the way** – up to nine of supermarket, pharmacy, petrol station, mosque, park, cafe,
   restaurant, ATM and EV charging. Live places are cached per map tile in `cache/` for a week.
+  With several, the best stop of each type is found and they are visited in whichever is quicker:
+  greedy nearest-neighbour order or the order they come along the route (FR7).
 * **Choosing a stop yourself** – tap any pin inside the corridor and press *Use this stop*; it replaces
   the automatic pick for that stop type and the order, times and route are recalculated. *Back to
   automatic* on the pin, or *Use automatic stops* under the trip, undoes it.
-  With several, the best stop of each type is found and the visiting order is chosen greedily (FR7).
+* **Go / Cancel** – *Go* (on *Where to*, or *Go with these stops* on *Drive*) starts the drive: the map
+  then shows only the chosen stops. *Cancel* brings every candidate back so you can choose again;
+  your picks are kept.
 * **Distance already driven** – where the vehicle is now; stops more than 250 m behind it are
   excluded (FR4).
 * **Corridor width** – 50 m to 3 km (default 150 m), half-width either side of the route. With a wide
   corridor the 40 most promising places of each stop type (by the offline estimate) get live drive times.
 * **Use live Overpass POI data** (on by default) – real POIs along the route in one Overpass query
-  (tries several mirrors); falls back to the offline sample if the query fails.
+  (tries the overpass-api.de servers in turn); falls back to the offline sample if the query fails.
 * **Use live OSRM routing** (on by default) – the real road route, road names and travel times;
   falls back to the offline road network and the heuristic cost model if unavailable.
-* **Find best stop** – runs the pipeline.
 
 The map shows the route ahead (blue) and already driven (grey), the corridor (faint band),
 candidates inside the corridor (category colour) and filtered out (grey), the suggested stops
