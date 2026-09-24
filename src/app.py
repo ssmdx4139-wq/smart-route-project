@@ -1,26 +1,7 @@
-"""The SmartRoute dashboard (FR8, FR9): Gradio for the interface, Folium for the map.
+"""SmartRoute dashboard: Gradio for the interface, Folium for the map (FR8, FR9).
 
-Run from the src folder:
-    python app.py
-then open the local address it prints (normally http://127.0.0.1:7860).
-
-The screen is laid out as SmartRoute running on an Apple CarPlay head unit:
-the CarPlay sidebar on the left (clock, signal, the SmartRoute app icon, Home /
-Work / Day-Night buttons), the navigation map filling the screen with a
-Waze-style turn banner, ETA bar, icon pins and the car, and a CarPlay tabbed
-list panel (Drive / Where to / Settings) on the right.
-
-Controls
-  * From / To          - pick a Dubai place, type a place name, or type "lat, lon" (FR1)
-  * Stops on the way   - up to nine categories, visited in the quicker of greedy or route order (FR7)
-  * Map pins           - tap a pin inside the corridor to choose that stop instead of the automatic one
-  * Go / Cancel        - Go shows only the chosen stops; Cancel brings every candidate back to choose from
-  * Corridor width     - 50 m to 3 km half-width of the Smart Corridor (FR3, FR9)
-  * Distance already driven - where the vehicle is now; stops behind it are excluded (FR4)
-  * Live data toggles  - Overpass POIs and OSRM routing, with labelled fallbacks (FR9, NFR5)
-
-Live calls that fail fall back to the offline data and the heuristic cost
-model, and the trip panel always says which source produced the numbers (NFR5).
+Run from the src folder with ``python app.py`` and open http://127.0.0.1:7860.
+The controls are described in the README.
 """
 
 import datetime
@@ -59,7 +40,7 @@ CATEGORY_ICONS = {
     "supermarket": "&#128722;",     # shopping cart
     "pharmacy": "&#128138;",        # pill
     "petrol station": "&#9981;",    # fuel pump
-    "mosque": "&#128332;",          # mosque
+    "mosque": "&#128332;",
     "park": "&#127795;",            # tree
     "cafe": "&#9749;",              # hot drink
     "restaurant": "&#127860;",      # fork and knife
@@ -72,15 +53,14 @@ CATEGORY_LABELS = {"supermarket": "Supermarket", "pharmacy": "Pharmacy", "petrol
 FILTERED_COLOR = "#8e8e93"
 TRIP_COLOR = "#30d158"
 CORRIDOR_CIRCLE_SPACING_M = 400.0
-MAX_CORRIDOR_M = 3000          # the corridor width slider goes up to 3 km
-MAX_COSTED = 40                # per stop type, candidates costed with live times (a 3 km corridor can hold hundreds)
-MAX_GREY_DOTS = 60             # per stop type, filtered-out candidates drawn on the map
-MAP_HEIGHT_PX = 700      # the height of the CarPlay screen
+MAX_CORRIDOR_M = 3000
+MAX_COSTED = 40                # per stop type; a 3 km corridor can hold hundreds, too many to cost live
+MAX_GREY_DOTS = 60
+MAP_HEIGHT_PX = 700
 DEFAULT_FROM, DEFAULT_TO = list(data_loader.PLACES)[:2]   # Office -> Home
 UI_FONT = "-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',Arial,sans-serif"
 
-# Map looks: Waze-like bright day map, CarPlay-like dark night map. OpenStreetMap tiles,
-# restyled with CSS filters so no API key is needed.
+# OpenStreetMap tiles restyled with CSS filters, so no API key is needed.
 THEMES = {
     "Night": {"tiles": "invert(1) hue-rotate(180deg) brightness(.9) contrast(.9) saturate(.5)", "bg": "#0b0b0d",
               "route": "#3ea6ff", "casing": "#0a3a7a", "done": "#5a5a5e", "band": "#3ea6ff",
@@ -140,7 +120,7 @@ def acquire_pois(categories: List[str], route, width_m: float, use_live: bool) -
         try:
             found = data_loader.load_live_pois_along(categories, route, max(width_m, 150.0) + 400.0)
             return found, "live OpenStreetMap (Overpass API)"
-        except Exception as exc:  # network, timeout, bad response
+        except Exception as exc:
             note = " - live query failed (%s)" % why(exc)
     return {c: data_loader.offline_pois(c) for c in categories}, "offline sample dataset" + note
 
@@ -270,7 +250,7 @@ def directions(route, steps, progress_m: float, length_m: float, stops: List[Cor
             at = pos
         go(name, max(at, start), end)
         at = end
-    for pos, n, c in events:  # anything left over (should not happen)
+    for pos, n, c in events:
         out.append(Step("stop", "Stop %d" % n, c.poi.name, 0.0, 0.0, c, n))
     out.append(Step("arrive", "Arrive at", to_label, 0.0))
     return out
@@ -555,13 +535,11 @@ def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_p
     root = fmap.get_root()
     root.header.add_child(folium.Element(map_css(th)))
 
-    # the Smart Corridor, a faint band along the route
     band = folium.FeatureGroup(name="Corridor")
     for p in corridor_circle_points(route, max(CORRIDOR_CIRCLE_SPACING_M, corridor.corridor_width_m)):
         folium.Circle(p, radius=corridor.corridor_width_m, stroke=False, fill=True, fill_color=th["band"], fill_opacity=0.10).add_to(band)
     band.add_to(fmap)
 
-    # the route, Waze style: a thick line with a darker casing; the driven part in grey
     done, ahead = split_route(route, progress_m)
     if len(done) > 1 and progress_m > 0:
         folium.PolyLine(done, color=th["done"], weight=8, opacity=0.9, tooltip=tip("Already driven")).add_to(fmap)
@@ -575,7 +553,6 @@ def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_p
         folium.PolyLine(trip_path, color=TRIP_COLOR, weight=5, opacity=1, dash_array="1 11", line_cap="round",
                         tooltip=tip("Your drive via the stops")).add_to(fmap)
 
-    # candidates: filtered out (small grey dots), inside the corridor (pins), suggested (big numbered pins)
     # once driving (after Go), only the chosen stops are shown
     chosen = {c.poi.id: i + 1 for i, c in enumerate(trip["stops"])}
     for cat, d in ({} if trip["navigating"] else per_category).items():
@@ -603,7 +580,6 @@ def build_folium_map(route, corridor, progress_m, per_category, sequence, trip_p
     heading = bearing_deg(point_along(route, progress_m), point_along(route, progress_m + 80))
     folium.Marker(ahead[0], icon=car_icon(heading), z_index_offset=2000, tooltip=tip("You")).add_to(fmap)
 
-    # overlays: turn banner, status pill, legend, ETA bar
     root.html.add_child(folium.Element(turn_banner(steps) + status_pill(trip) + legend(per_category, th, trip) + eta_bar(trip)))
     pts = list(ahead) + [c.poi.coord for c in trip["stops"]]
     fmap.fit_bounds([[min(p[0] for p in pts), min(p[1] for p in pts)], [max(p[0] for p in pts), max(p[1] for p in pts)]],
@@ -683,7 +659,6 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
                    'Settings, or run <code>python check_live.py</code> in the src folder to see what is blocked.</div></div>'
                    % html.escape(reason))
 
-    # suggested stops
     ranked_of = {r.candidate.poi.id: r for d in per_category.values() for r in d["ranked"]}
     if trip["stops"]:
         items = []
@@ -710,7 +685,6 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
                    '<div class="sr-sub">Widen the corridor with the <b>Corridor width</b> slider above to search further from the road.</div></div>'
                    % (" or ".join(CATEGORY_LABELS[c].lower() for c in missing), km(trip["width_m"])))
 
-    # directions
     rows = []
     for s in steps:
         if s.kind == "go":
@@ -724,7 +698,6 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
                         % (arrow_svg(s, 22), html.escape(s.road)))
     out.append('<div class="sr-card"><div class="sr-h">Directions</div>%s</div>' % "".join(rows))
 
-    # the evidence: corridor vs radius, per stop type (collapsed)
     det = []
     for cat, d in per_category.items():
         det.append('<div class="sr-name" style="margin-top:10px">%s %s &middot; %d found, %d inside the %s corridor</div>'
@@ -748,12 +721,8 @@ def trip_panel(trip, per_category, sequence, steps: List[Step]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Interface: SmartRoute running on a CarPlay head unit
+# Interface
 # ---------------------------------------------------------------------------
-# The whole window is the CarPlay screen: a CarPlay sidebar on the left (clock,
-# signal, the SmartRoute app icon, quick destinations, day/night, dashboard
-# button), the navigation map filling the screen, and a CarPlay-style tabbed
-# list panel (Drive / Where to / Settings) on the right.
 PAGE_CSS = """
 body, gradio-app { background: #000 !important; }
 .gradio-container { max-width: 100% !important; padding: 0 !important; margin: 0 !important; font-family: %(font)s !important;
@@ -902,7 +871,6 @@ def make_ui() -> gr.Blocks:
     cat_choices = [("%s %s" % (html.unescape(CATEGORY_ICONS[c]), CATEGORY_LABELS[c]), c) for c in data_loader.CATEGORIES]
     with gr.Blocks(title="SmartRoute · CarPlay", theme=theme, css=PAGE_CSS, js=PAGE_JS) as demo:
         with gr.Row(elem_id="display", equal_height=True):
-            # CarPlay sidebar
             with gr.Column(elem_id="sidebar", scale=0, min_width=88):
                 gr.HTML(STATUS)
                 gr.HTML(APP_ICON)
@@ -914,10 +882,8 @@ def make_ui() -> gr.Blocks:
                 gr.HTML('<div class="slabel">Day/Night</div>')
                 gr.HTML("", elem_classes="spacer")
                 gr.HTML(DASH_BUTTON)
-            # the SmartRoute app: map ...
             with gr.Column(scale=7, min_width=480, elem_id="mapcol"):
                 map_html = gr.HTML(elem_id="mapcard")
-            # ... and its CarPlay list panel
             with gr.Column(scale=3, min_width=350, elem_id="panel"):
                 with gr.Tabs(elem_id="tabs", selected="drive") as tabs:
                     with gr.Tab("Drive", id="drive"):
